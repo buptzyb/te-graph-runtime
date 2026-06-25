@@ -3,25 +3,74 @@
 TE-compatible CUDA graph callable runtime with optional TransformerEngine
 integration and a PyTorch-only runtime path.
 
-The public entrypoint intentionally matches TransformerEngine's
-`make_graphed_callables` API:
-
 ```python
 from te_graph_runtime import make_graphed_callables
 ```
 
-## Current state
-
-This repository is bootstrapped from TransformerEngine `v2.16`. The runtime does
-not delegate to `transformer_engine.pytorch.graph.make_graphed_callables` or to
-`torch.cuda.make_graphed_callables`; it implements capture/replay directly with
+The public entrypoint intentionally follows TransformerEngine `v2.16`'s
+`make_graphed_callables` API. The implementation does not delegate to
+`transformer_engine.pytorch.graph.make_graphed_callables` or to
+`torch.cuda.make_graphed_callables`; it captures and replays graphs directly with
 PyTorch CUDA graph and autograd primitives.
 
-- Package import is lazy and does not import `torch` or `transformer_engine`.
-- If `transformer_engine` internals are available at call time, TE-specific FP8,
-  amax, recipe, and module-state behavior is enabled through those internals.
-- If `transformer_engine` is not available, generic graphing features remain
-  available, while FP8/TE-specific options fail fast with an actionable error.
-- The source-compatible API is pinned to the TE `v2.16` signature.
+## Install
+
+Editable checkout:
+
+```bash
+pip install -e .
+```
+
+With optional TransformerEngine support:
+
+```bash
+pip install -e '.[te]'
+```
+
+Importing `te_graph_runtime` is lazy: it does not import `torch` or
+`transformer_engine` until `make_graphed_callables` is called.
+
+## Runtime modes
+
+- **No TransformerEngine installed:** generic PyTorch `nn.Module` graphing works,
+  including `sample_kwargs`, `_order`, `_num_layers_per_chunk`, warmup hooks,
+  graph reset, stream/event replay kwargs, and structural `backward_dw` support.
+  FP8/TE-specific options fail fast with an actionable error.
+- **TransformerEngine installed:** TE internals are used for FP8/FP4 recipes,
+  amax reduction, TE module state save/restore, TE RNG tracker state, and TE
+  module `backward_dw` handling. Tests compare behavior with TE's upstream
+  implementation.
+
+## Examples
+
+- `examples/custom_framework_minimal.py` - wrap a custom framework block and use
+  keyword tensor inputs.
+- `examples/custom_framework_pipeline.py` - integrate an interleaved pipeline
+  schedule with `_order` and optional static-buffer reuse.
+- `examples/optional_te_fp8.py` - use one code path that enables FP8 only when
+  TransformerEngine and FP8-capable hardware are present.
+
+See `docs/custom_framework_integration.md` for integration patterns, failure
+modes, and test commands.
+
+## Test commands
+
+CPU/local static tests:
+
+```bash
+PYTHONPATH=src python -m pytest -q
+```
+
+GPU tests without requiring TransformerEngine:
+
+```bash
+PYTHONPATH=src python -m pytest -q tests/test_cuda_runtime.py
+```
+
+GPU tests with TransformerEngine parity checks:
+
+```bash
+PYTHONPATH=src python -m pytest -q tests/test_te_parity.py
+```
 
 See `UPSTREAM.md` for the pinned upstream source and update workflow.
