@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "te-graph-runtime"
+version = "0.1.0"
+description = "TE-compatible CUDA graph callable runtime with optional TransformerEngine integration."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "torch",
+]
+
+[project.optional-dependencies]
+te = [
+    "transformer-engine[pytorch]",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
