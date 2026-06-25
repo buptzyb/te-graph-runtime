@@ -9,6 +9,14 @@ This repository starts from TransformerEngine's PyTorch CUDA graph helper.
 - Local baseline copy:
   `src/te_graph_runtime/_upstream/transformer_engine_v2_16_graph.py`
 
+## Carried upstream patches
+
+- NVIDIA/TransformerEngine PR #2937 (`Fix CUDA graph parameter grad lifetime`):
+  adds `_clone_param_grads_on_return` and clones returned parameter-gradient
+  slots by default so graph replay does not expose CUDA graph static buffers to
+  downstream autograd users. This repo carries the PR on top of the v2.16
+  baseline because it is relevant to the standalone runtime behavior.
+
 ## Update workflow
 
 1. Add a new upstream copy for the next TransformerEngine release tag.

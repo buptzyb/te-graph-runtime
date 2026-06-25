@@ -164,3 +164,172 @@ def test_cuda_structural_backward_dw_protocol_without_te(monkeypatch: pytest.Mon
     assert hasattr(graphed, "backward_dw")
     graphed(torch.randn(2, 4, device="cuda", requires_grad=True)).sum().backward()
     graphed.backward_dw()
+
+
+
+def _new_linear_for_grad_lifetime_test():
+    model = torch.nn.Linear(4, 4, bias=False).cuda()
+    sample = torch.randn(2, 4, device="cuda", requires_grad=False)
+    return model, sample
+
+
+def _run_weight_grad_step(model, x, grad):
+    output = model(x)
+    output.backward(grad)
+    torch.cuda.synchronize()
+
+
+def _save_hooked_grads(param):
+    seen = []
+
+    def save_grad(grad):
+        seen.append(grad)
+        return grad
+
+    return seen, param.register_hook(save_grad)
+
+
+def test_cuda_parameter_grads_are_owned_without_te(monkeypatch: pytest.MonkeyPatch) -> None:
+    _force_no_te(monkeypatch)
+    torch.manual_seed(501)
+    model, sample = _new_linear_for_grad_lifetime_test()
+    graphed = graph.make_graphed_callables(model, (sample,), allow_unused_input=True)
+    seen_grads, hook = _save_hooked_grads(model.weight)
+    try:
+        _run_weight_grad_step(
+            graphed,
+            torch.randn(2, 4, device="cuda"),
+            torch.randn(2, 4, device="cuda"),
+        )
+        assert len(seen_grads) == 1
+        first_grad = seen_grads[0]
+        first_grad_ptr = first_grad.data_ptr()
+        first_grad_snapshot = first_grad.clone()
+
+        model.zero_grad(set_to_none=True)
+        _run_weight_grad_step(
+            graphed,
+            torch.randn(2, 4, device="cuda"),
+            torch.randn(2, 4, device="cuda"),
+        )
+
+        assert len(seen_grads) == 2
+        assert first_grad.data_ptr() == first_grad_ptr
+        assert seen_grads[1].data_ptr() != first_grad_ptr
+        torch.testing.assert_close(first_grad, first_grad_snapshot, rtol=0, atol=0)
+    finally:
+        hook.remove()
+        graphed.reset()
+
+
+def test_cuda_parameter_grad_accumulation_without_te(monkeypatch: pytest.MonkeyPatch) -> None:
+    _force_no_te(monkeypatch)
+    torch.manual_seed(502)
+    model, sample = _new_linear_for_grad_lifetime_test()
+    graphed = graph.make_graphed_callables(model, (sample,), allow_unused_input=True)
+    x1 = torch.randn(2, 4, device="cuda")
+    g1 = torch.randn(2, 4, device="cuda")
+    x2 = torch.randn(2, 4, device="cuda")
+    g2 = torch.randn(2, 4, device="cuda")
+    expected = torch.einsum("bo,bi->oi", g1, x1) + torch.einsum("bo,bi->oi", g2, x2)
+    try:
+        model.zero_grad(set_to_none=True)
+        _run_weight_grad_step(graphed, x1, g1)
+        _run_weight_grad_step(graphed, x2, g2)
+        torch.testing.assert_close(model.weight.grad, expected, rtol=1e-5, atol=1e-5)
+    finally:
+        graphed.reset()
+
+
+def test_cuda_skipped_parameter_grad_alias_is_preserved_without_te(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _force_no_te(monkeypatch)
+    torch.manual_seed(503)
+    model, sample = _new_linear_for_grad_lifetime_test()
+    model.weight.skip_backward_post_hook = True
+    graphed = graph.make_graphed_callables(model, (sample,), allow_unused_input=True)
+    seen_grads, hook = _save_hooked_grads(model.weight)
+    try:
+        _run_weight_grad_step(
+            graphed,
+            torch.randn(2, 4, device="cuda"),
+            torch.randn(2, 4, device="cuda"),
+        )
+        first_grad_ptr = seen_grads[0].data_ptr()
+        model.zero_grad(set_to_none=True)
+        _run_weight_grad_step(
+            graphed,
+            torch.randn(2, 4, device="cuda"),
+            torch.randn(2, 4, device="cuda"),
+        )
+        assert len(seen_grads) == 2
+        assert seen_grads[1].data_ptr() == first_grad_ptr
+    finally:
+        hook.remove()
+        graphed.reset()
+
+
+def test_cuda_parameter_grad_clone_can_be_disabled_without_te(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _force_no_te(monkeypatch)
+    torch.manual_seed(504)
+    model, sample = _new_linear_for_grad_lifetime_test()
+    graphed = graph.make_graphed_callables(
+        model,
+        (sample,),
+        allow_unused_input=True,
+        _clone_param_grads_on_return=False,
+    )
+    seen_grads, hook = _save_hooked_grads(model.weight)
+    try:
+        _run_weight_grad_step(
+            graphed,
+            torch.randn(2, 4, device="cuda"),
+            torch.randn(2, 4, device="cuda"),
+        )
+        first_grad_ptr = seen_grads[0].data_ptr()
+        model.zero_grad(set_to_none=True)
+        _run_weight_grad_step(
+            graphed,
+            torch.randn(2, 4, device="cuda"),
+            torch.randn(2, 4, device="cuda"),
+        )
+        assert len(seen_grads) == 2
+        assert seen_grads[1].data_ptr() == first_grad_ptr
+    finally:
+        hook.remove()
+        graphed.reset()
+
+
+def test_cuda_parameter_grad_clone_policy_is_snapshotted_without_te(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _force_no_te(monkeypatch)
+    torch.manual_seed(505)
+    model, sample = _new_linear_for_grad_lifetime_test()
+    graphed = graph.make_graphed_callables(model, (sample,), allow_unused_input=True)
+    model.weight.skip_backward_post_hook = True
+    seen_grads, hook = _save_hooked_grads(model.weight)
+    try:
+        _run_weight_grad_step(
+            graphed,
+            torch.randn(2, 4, device="cuda"),
+            torch.randn(2, 4, device="cuda"),
+        )
+        first_grad = seen_grads[0]
+        first_grad_ptr = first_grad.data_ptr()
+        first_grad_snapshot = first_grad.clone()
+        model.zero_grad(set_to_none=True)
+        _run_weight_grad_step(
+            graphed,
+            torch.randn(2, 4, device="cuda"),
+            torch.randn(2, 4, device="cuda"),
+        )
+        assert len(seen_grads) == 2
+        assert seen_grads[1].data_ptr() != first_grad_ptr
+        torch.testing.assert_close(first_grad, first_grad_snapshot, rtol=0, atol=0)
+    finally:
+        hook.remove()
+        graphed.reset()

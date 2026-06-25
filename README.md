@@ -8,7 +8,8 @@ from te_graph_runtime import make_graphed_callables
 ```
 
 The public entrypoint intentionally follows TransformerEngine `v2.16`'s
-`make_graphed_callables` API. The implementation does not delegate to
+`make_graphed_callables` API, with the CUDA graph parameter-gradient lifetime
+fix from NVIDIA/TransformerEngine PR #2937 carried on top. The implementation does not delegate to
 `transformer_engine.pytorch.graph.make_graphed_callables` or to
 `torch.cuda.make_graphed_callables`; it captures and replays graphs directly with
 PyTorch CUDA graph and autograd primitives.
@@ -34,8 +35,9 @@ Importing `te_graph_runtime` is lazy: it does not import `torch` or
 
 - **No TransformerEngine installed:** generic PyTorch `nn.Module` graphing works,
   including `sample_kwargs`, `_order`, `_num_layers_per_chunk`, warmup hooks,
-  graph reset, stream/event replay kwargs, and structural `backward_dw` support.
-  FP8/TE-specific options fail fast with an actionable error.
+  graph reset, stream/event replay kwargs, structural `backward_dw` support, and
+  PR #2937's `_clone_param_grads_on_return` lifetime policy. FP8/TE-specific
+  options fail fast with an actionable error.
 - **TransformerEngine installed:** TE internals are used for FP8/FP4 recipes,
   amax reduction, TE module state save/restore, TE RNG tracker state, and TE
   module `backward_dw` handling. Tests compare behavior with TE's upstream

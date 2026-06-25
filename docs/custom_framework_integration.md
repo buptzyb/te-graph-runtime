@@ -75,7 +75,11 @@ layer_forwards = make_graphed_callables(
 ```
 
 Use buffer reuse only when the framework's communication schedule guarantees the
-old static outputs and grad inputs are no longer needed.
+old static outputs and grad inputs are no longer needed. Returned parameter grads
+are cloned by default to avoid exposing CUDA graph static buffers. Advanced
+frameworks that consume parameter grads before any later replay can pass
+`_clone_param_grads_on_return=False` to skip the extra clone, but retained grad
+hooks and `.grad` tensors then have non-standard lifetime semantics.
 
 ## Case 4: Delayed weight-gradient protocol
 
