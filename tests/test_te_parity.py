@@ -25,15 +25,17 @@ def test_signature_matches_installed_te() -> None:
         assert runtime_param.default == te_param.default
 
     extra_params = set(runtime_sig.parameters) - set(te_sig.parameters)
-    # Older installed TE builds can be behind our v2.16+PR2937 surface. If the
+    # Older installed TE builds can be behind our v2.16+carried-PR surface. If the
     # installed TE already includes these parameters, they are compared above.
     assert extra_params <= {
         "pre_warmup_hook",
         "post_warmup_hook",
         "_clone_param_grads_on_return",
+        "capture_time_hooks",
     }
     for name in extra_params:
-        assert runtime_sig.parameters[name].default is None if name.endswith("_hook") else True
+        expected_default = True if name == "_clone_param_grads_on_return" else None
+        assert runtime_sig.parameters[name].default is expected_default
 
 
 def test_deprecated_conflict_errors_match_te(monkeypatch: pytest.MonkeyPatch) -> None:

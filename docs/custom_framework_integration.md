@@ -81,7 +81,32 @@ frameworks that consume parameter grads before any later replay can pass
 `_clone_param_grads_on_return=False` to skip the extra clone, but retained grad
 hooks and `.grad` tensors then have non-standard lifetime semantics.
 
-## Case 4: Delayed weight-gradient protocol
+## Case 4: Capture-time framework hooks
+
+Framework hooks registered directly on `torch.nn.Module` are rejected during
+graph capture because they may be recorded into the CUDA graph. If a framework
+must run non-capturable bookkeeping during warmup and capture, pass the hook
+functions explicitly through `capture_time_hooks`. They run outside CUDA graph
+capture and are not replayed.
+
+```python
+capture_hooks = [{
+    "forward_pre_hooks": {0: lambda module, args: prepare(module)},
+    "backward_hooks": {1: lambda module, grad_in, grad_out: finalize(module)},
+}]
+graphed_block = make_graphed_callables(
+    block,
+    (sample_hidden_states,),
+    capture_time_hooks=capture_hooks,
+)
+```
+
+Hook list entries correspond to callables, not microbatches. Hooks must return
+`None`; modifying args, kwargs, outputs, or gradients by returning replacements
+is rejected. For hook signatures with kwargs, include the hook ID in
+`forward_pre_hooks_with_kwargs` or `forward_hooks_with_kwargs`.
+
+## Case 5: Delayed weight-gradient protocol
 
 A non-TE framework can participate in delayed wgrad capture by exposing a small
 structural protocol on modules:
@@ -98,7 +123,7 @@ class MyLinear(torch.nn.Linear):
 Captured callables receive a `backward_dw()` attribute. Framework schedulers can
 call it at the same place they would call TE's delayed wgrad hook.
 
-## Case 5: Optional TransformerEngine / FP8
+## Case 6: Optional TransformerEngine / FP8
 
 Use one code path and enable FP8 only when TE and hardware support it.
 
@@ -125,7 +150,8 @@ features continue to work.
 
 - Shape or kwarg-key changes after capture are invalid.
 - Hooks registered before capture are rejected; register framework hooks after
-  graphing, or wrap the hook behavior inside the module forward.
+  graphing, wrap the hook behavior inside the module forward, or pass
+  non-capturable capture-time behavior through `capture_time_hooks`.
 - Modules must be all training or all inference during capture.
 - TE FP8 parity depends on TransformerEngine internals compatible with the pinned
   upstream baseline in `UPSTREAM.md`.

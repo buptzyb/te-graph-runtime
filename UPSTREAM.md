@@ -16,6 +16,10 @@ This repository starts from TransformerEngine's PyTorch CUDA graph helper.
   slots by default so graph replay does not expose CUDA graph static buffers to
   downstream autograd users. This repo carries the PR on top of the v2.16
   baseline because it is relevant to the standalone runtime behavior.
+- NVIDIA/TransformerEngine PR #2831 (`Add capture_time_hooks to make_graphed_callables`):
+  adds per-callable hooks that run during warmup and graph capture, outside the
+  CUDA graph capture context, so non-capturable framework bookkeeping can be
+  performed without being recorded into graph replay.
 
 ## Update workflow
 

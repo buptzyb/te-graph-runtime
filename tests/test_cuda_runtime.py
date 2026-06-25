@@ -131,6 +131,186 @@ def test_cuda_warmup_hooks_without_te(monkeypatch: pytest.MonkeyPatch) -> None:
     assert calls == {"pre": 1, "post": 1}
 
 
+def _assert_not_cuda_capturing() -> None:
+    is_current_stream_capturing = getattr(torch.cuda, "is_current_stream_capturing", None)
+    if is_current_stream_capturing is not None:
+        assert not is_current_stream_capturing()
+
+
+def test_cuda_capture_time_hooks_run_only_during_capture_without_te(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _force_no_te(monkeypatch)
+
+    class ScaleLinear(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = torch.nn.Linear(4, 4)
+
+        def forward(self, x, scale):
+            return self.linear(x) * scale
+
+    model = ScaleLinear().cuda()
+    sample = torch.randn(2, 4, device="cuda", requires_grad=True)
+    sample_scale = torch.ones(2, 4, device="cuda")
+    calls = {"pre": 0, "pre_kwargs": 0, "fwd": 0, "fwd_kwargs": 0, "bwd_pre": 0, "bwd": 0}
+
+    def pre_hook(module, args):
+        _assert_not_cuda_capturing()
+        assert module is model
+        assert len(args) == 1
+        calls["pre"] += 1
+
+    def pre_kwargs_hook(module, args, kwargs):
+        _assert_not_cuda_capturing()
+        assert module is model
+        assert "scale" in kwargs
+        calls["pre_kwargs"] += 1
+
+    def fwd_hook(module, args, output):
+        _assert_not_cuda_capturing()
+        assert module is model
+        assert isinstance(output, torch.Tensor)
+        calls["fwd"] += 1
+
+    def fwd_kwargs_hook(module, args, kwargs, output):
+        _assert_not_cuda_capturing()
+        assert module is model
+        assert "scale" in kwargs
+        assert isinstance(output, torch.Tensor)
+        calls["fwd_kwargs"] += 1
+
+    def bwd_pre_hook(module, grad_output):
+        _assert_not_cuda_capturing()
+        assert module is model
+        assert len(grad_output) == 1
+        calls["bwd_pre"] += 1
+
+    def bwd_hook(module, grad_input, grad_output):
+        _assert_not_cuda_capturing()
+        assert module is model
+        assert len(grad_input) > 0
+        assert len(grad_output) == 1
+        calls["bwd"] += 1
+
+    graphed = graph.make_graphed_callables(
+        model,
+        (sample,),
+        sample_kwargs={"scale": sample_scale},
+        allow_unused_input=True,
+        num_warmup_iters=2,
+        capture_time_hooks=[
+            {
+                "forward_pre_hooks": {1: pre_hook, 2: pre_kwargs_hook},
+                "forward_pre_hooks_with_kwargs": {2: True},
+                "forward_hooks": {3: fwd_hook, 4: fwd_kwargs_hook},
+                "forward_hooks_with_kwargs": {4: True},
+                "backward_pre_hooks": {5: bwd_pre_hook},
+                "backward_hooks": {6: bwd_hook},
+            }
+        ],
+    )
+    expected_calls = {name: 3 for name in calls}
+    assert calls == expected_calls
+
+    x = torch.randn(2, 4, device="cuda", requires_grad=True)
+    scale = torch.full((2, 4), 2.0, device="cuda")
+    graphed(x, scale=scale).sum().backward()
+    torch.cuda.synchronize()
+    assert calls == expected_calls
+    graphed.reset()
+
+
+def test_cuda_capture_time_hooks_follow_order_without_te(monkeypatch: pytest.MonkeyPatch) -> None:
+    _force_no_te(monkeypatch)
+    layers = torch.nn.ModuleList([torch.nn.Linear(4, 4).cuda(), torch.nn.Linear(4, 4).cuda()])
+    sample_args = tuple(
+        (torch.randn(2, 4, device="cuda", requires_grad=True),) for _ in range(4)
+    )
+    counts = [{"fwd": 0, "bwd": 0}, {"fwd": 0, "bwd": 0}]
+
+    def make_fwd_hook(layer_idx):
+        def hook(module, args):
+            _assert_not_cuda_capturing()
+            assert module is layers[layer_idx]
+            counts[layer_idx]["fwd"] += 1
+
+        return hook
+
+    def make_bwd_hook(layer_idx):
+        def hook(module, grad_input, grad_output):
+            _assert_not_cuda_capturing()
+            assert module is layers[layer_idx]
+            counts[layer_idx]["bwd"] += 1
+
+        return hook
+
+    forwards = graph.make_graphed_callables(
+        tuple(layers),
+        sample_args,
+        allow_unused_input=True,
+        num_warmup_iters=1,
+        _order=[1, 2, 1, 2, -2, -1, -2, -1],
+        capture_time_hooks=[
+            {"forward_pre_hooks": {1: make_fwd_hook(0)}, "backward_hooks": {2: make_bwd_hook(0)}},
+            {"forward_pre_hooks": {1: make_fwd_hook(1)}, "backward_hooks": {2: make_bwd_hook(1)}},
+        ],
+    )
+    assert counts == [{"fwd": 4, "bwd": 4}, {"fwd": 4, "bwd": 4}]
+    x = torch.randn(2, 4, device="cuda", requires_grad=True)
+    forwards[1](forwards[0](x)).sum().backward()
+    torch.cuda.synchronize()
+    assert counts == [{"fwd": 4, "bwd": 4}, {"fwd": 4, "bwd": 4}]
+    for forward in forwards:
+        forward.reset()
+
+
+def test_cuda_capture_time_hooks_validate_shape_without_te(monkeypatch: pytest.MonkeyPatch) -> None:
+    _force_no_te(monkeypatch)
+    model = torch.nn.Linear(4, 4).cuda()
+    sample = torch.randn(2, 4, device="cuda", requires_grad=True)
+    with pytest.raises(ValueError, match="capture_time_hooks"):
+        graph.make_graphed_callables(
+            model,
+            (sample,),
+            allow_unused_input=True,
+            capture_time_hooks=[None, None],
+        )
+
+
+def test_cuda_capture_time_hook_return_value_is_rejected_without_te(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _force_no_te(monkeypatch)
+    model = torch.nn.Linear(4, 4).cuda()
+    sample = torch.randn(2, 4, device="cuda", requires_grad=True)
+
+    def bad_hook(module, args):
+        return args
+
+    with pytest.raises(RuntimeError, match="forward_pre_hooks"):
+        graph.make_graphed_callables(
+            model,
+            (sample,),
+            allow_unused_input=True,
+            capture_time_hooks=[{"forward_pre_hooks": {1: bad_hook}}],
+        )
+
+
+def test_cuda_registered_backward_pre_hooks_are_rejected_without_te(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _force_no_te(monkeypatch)
+    model = torch.nn.Linear(4, 4).cuda()
+    sample = torch.randn(2, 4, device="cuda", requires_grad=True)
+    handle = model.register_full_backward_pre_hook(lambda module, grad_output: None)
+    try:
+        with pytest.raises(RuntimeError, match="capture_time_hooks"):
+            graph.make_graphed_callables(model, (sample,), allow_unused_input=True)
+    finally:
+        handle.remove()
+
+
 def test_cuda_eval_mode_falls_back_to_original_forward_without_te(monkeypatch: pytest.MonkeyPatch) -> None:
     _force_no_te(monkeypatch)
 

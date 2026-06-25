@@ -271,6 +271,71 @@ _IS_GRAPH_CAPTURING = False
 _T = TypeVar("_T")
 SingleOrTuple = Union[_T, Tuple[_T, ...]]
 
+_CAPTURE_TIME_HOOK_KEYS = (
+    "forward_pre_hooks",
+    "forward_pre_hooks_with_kwargs",
+    "forward_hooks",
+    "forward_hooks_with_kwargs",
+    "backward_pre_hooks",
+    "backward_hooks",
+)
+
+
+def _empty_capture_time_hooks() -> Dict[str, Dict[Any, Any]]:
+    return {key: {} for key in _CAPTURE_TIME_HOOK_KEYS}
+
+
+def _canonicalize_capture_time_hooks(
+    num_callables: int,
+    capture_time_hooks: Optional[List[Optional[Dict[str, Dict]]]],
+) -> List[Dict[str, Dict[Any, Any]]]:
+    if capture_time_hooks is None:
+        return [_empty_capture_time_hooks() for _ in range(num_callables)]
+    if len(capture_time_hooks) != num_callables:
+        raise ValueError(
+            f"capture_time_hooks has {len(capture_time_hooks)} entries but there are "
+            f"{num_callables} callables"
+        )
+
+    canonicalized = []
+    for callable_idx, hooks in enumerate(capture_time_hooks):
+        if hooks is None:
+            canonicalized.append(_empty_capture_time_hooks())
+            continue
+        if not isinstance(hooks, dict):
+            raise TypeError(
+                "capture_time_hooks entries must be dicts or None, "
+                f"but entry {callable_idx} has type {type(hooks).__name__}"
+            )
+        unknown_keys = sorted(set(hooks) - set(_CAPTURE_TIME_HOOK_KEYS))
+        if unknown_keys:
+            raise ValueError(
+                f"Unknown capture_time_hooks keys for callable {callable_idx}: {unknown_keys}. "
+                f"Supported keys are {list(_CAPTURE_TIME_HOOK_KEYS)}"
+            )
+
+        callable_hooks = _empty_capture_time_hooks()
+        for key in _CAPTURE_TIME_HOOK_KEYS:
+            value = hooks.get(key, {})
+            if value is None:
+                value = {}
+            if not isinstance(value, dict):
+                raise TypeError(
+                    f"capture_time_hooks[{callable_idx!r}][{key!r}] must be a dict, "
+                    f"but got {type(value).__name__}"
+                )
+            callable_hooks[key] = dict(value)
+        canonicalized.append(callable_hooks)
+    return canonicalized
+
+
+def _check_capture_time_hook_return(value: Any, hook_name: str, detail: str) -> None:
+    if value is not None:
+        raise RuntimeError(
+            f"capture_time_hooks {hook_name} must not return a value ({detail} must not be "
+            "modified via hook return)"
+        )
+
 
 def set_capture_start() -> None:
     """Record beginning of `make_graphed_callables`."""
@@ -346,6 +411,7 @@ def _make_graphed_callables(
     _clone_param_grads_on_return: bool = True,
     pre_warmup_hook: Optional[Callable] = None,
     post_warmup_hook: Optional[Callable] = None,
+    capture_time_hooks: Optional[List[Optional[Dict[str, Dict]]]] = None,
 ) -> SingleOrTuple[Callable]:
     """
     Helper method for `make_graphed_callables`
@@ -371,6 +437,8 @@ def _make_graphed_callables(
         callables = (callables,)
         sample_args = (sample_args,)
         sample_kwargs = (sample_kwargs,)
+
+    capture_time_hooks = _canonicalize_capture_time_hooks(len(callables), capture_time_hooks)
 
     # Check training/inference
     is_training = all(c.training for c in callables)
@@ -572,13 +640,16 @@ def _make_graphed_callables(
         if isinstance(c, torch.nn.Module):
             if not (
                 len(c._backward_hooks) == 0
+                and len(c._backward_pre_hooks) == 0
                 and len(c._forward_hooks) == 0
                 and len(c._forward_pre_hooks) == 0
             ):
                 raise RuntimeError(
                     "Modules must not have hooks registered at the time they are passed. "
                     + "However, registering hooks on modules after passing them "
-                    + "through make_graphed_callables is allowed."
+                    + "through make_graphed_callables is allowed. If you need hooks during "
+                    + "capture, pass them with capture_time_hooks so they run outside CUDA "
+                    + "graph capture and are not replayed."
                 )
             if not all(b.requires_grad is False for b in c.buffers()):
                 raise RuntimeError(
@@ -700,113 +771,202 @@ def _make_graphed_callables(
     visited_te_modules = {}
     need_bwd_dw_graph = {}
 
+    def _call_capture_time_forward_pre_hooks(callable_idx, func, args, kwargs) -> None:
+        hooks = capture_time_hooks[callable_idx]
+        with_kwargs = hooks["forward_pre_hooks_with_kwargs"]
+        for hook_id, hook in hooks["forward_pre_hooks"].items():
+            if hook_id in with_kwargs:
+                _check_capture_time_hook_return(
+                    hook(func, args, kwargs),
+                    "forward_pre_hooks",
+                    "args/kwargs",
+                )
+            else:
+                _check_capture_time_hook_return(
+                    hook(func, args),
+                    "forward_pre_hooks",
+                    "args",
+                )
+
+    def _call_capture_time_forward_hooks(callable_idx, func, args, kwargs, outputs) -> None:
+        hooks = capture_time_hooks[callable_idx]
+        with_kwargs = hooks["forward_hooks_with_kwargs"]
+        for hook_id, hook in hooks["forward_hooks"].items():
+            if hook_id in with_kwargs:
+                _check_capture_time_hook_return(
+                    hook(func, args, kwargs, outputs),
+                    "forward_hooks",
+                    "output",
+                )
+            else:
+                _check_capture_time_hook_return(
+                    hook(func, args, outputs),
+                    "forward_hooks",
+                    "output",
+                )
+
+    def _call_capture_time_backward_pre_hooks(callable_idx, func, grad_outputs) -> None:
+        for hook in capture_time_hooks[callable_idx]["backward_pre_hooks"].values():
+            _check_capture_time_hook_return(
+                hook(func, grad_outputs),
+                "backward_pre_hooks",
+                "grad_output",
+            )
+
+    def _call_capture_time_backward_hooks(callable_idx, func, grad_inputs, grad_outputs) -> None:
+        for hook in capture_time_hooks[callable_idx]["backward_hooks"].values():
+            _check_capture_time_hook_return(
+                hook(func, grad_inputs, grad_outputs),
+                "backward_hooks",
+                "grad_input",
+            )
+
+    def _make_grad_outputs(outputs):
+        return tuple(
+            torch.empty_like(o) if o is not None and o.requires_grad else None for o in outputs
+        )
+
+    def _run_warmup_forward(func_idx, func, callable_idx):
+        args = sample_args[func_idx]
+        kwargs = sample_kwargs[func_idx]
+
+        def hook_fn(module, inputs, outputs, func_idx=func_idx):  # pylint: disable=unused-argument
+            modules = set()
+            if isinstance(module, TransformerEngineBaseModule):
+                modules.add(module)
+            # If forward is called on a BasicOperation directly the hook will run.
+            elif isinstance(module, BasicOperation):
+                modules.add(module)
+            elif hasattr(module, "need_backward_dw") and hasattr(module, "backward_dw"):
+                modules.add(module)
+            # If forward is called on a te.ops.Sequential it is not called on its constituent ops.
+            elif isinstance(module, Sequential):
+                if module._module_groups is None:
+                    raise RuntimeError("module._module_groups should have been initialized by warmup")
+                for module_group in module._module_groups:
+                    if isinstance(module_group, OperationFuser):
+                        for basic_op in module_group._basic_ops:
+                            modules.add(basic_op)
+            if modules:
+                if func_idx not in visited_te_modules:
+                    visited_te_modules[func_idx] = modules
+                else:
+                    visited_te_modules[func_idx].update(modules)
+
+        _call_capture_time_forward_pre_hooks(callable_idx, func, args, kwargs)
+        hooks = []
+        if isinstance(func, torch.nn.Module):
+            for module in func.modules():
+                hooks.append(module.register_forward_hook(hook_fn))
+        outputs = func(*args, **kwargs)
+        for hook in hooks:
+            hook.remove()
+        _call_capture_time_forward_hooks(callable_idx, func, args, kwargs, outputs)
+        flatten_outputs, _ = _tree_flatten(outputs)
+        return flatten_outputs
+
+    def _run_warmup_backward(func_idx, func, outputs, warmup_iter, callable_idx) -> None:
+        static_input_surface = per_callable_static_input_surfaces[func_idx]
+        inputs = tuple(i for i in static_input_surface if i.requires_grad)
+        outputs_requiring_grad = tuple(o for o in outputs if o is not None and o.requires_grad)
+        grad_outputs = _make_grad_outputs(outputs)
+
+        _call_capture_time_backward_pre_hooks(callable_idx, func, grad_outputs)
+        with _none_grad_context_wrapper(inputs):
+            torch.autograd.backward(
+                outputs_requiring_grad,
+                grad_tensors=tuple(o for o in grad_outputs if o is not None),
+            )
+            grad_inputs = tuple(input.grad for input in inputs)
+        _call_capture_time_backward_hooks(callable_idx, func, grad_inputs, grad_outputs)
+
+        # Filter module params that get None grad from grad_inputs and remove them
+        # from static_input_surface. This is to ensure that the backward hooks
+        # registered to these params are not wrongly triggered.
+        num_required_grad_sample_args = sum(arg.requires_grad for arg in flatten_sample_args[func_idx])
+        required_grad_input_idx = []
+        for i, arg in enumerate(static_input_surface):
+            if arg.requires_grad:
+                required_grad_input_idx.append(i)
+        module_params_with_grad = []
+        for grad_inputs_idx, inputs_idx in enumerate(required_grad_input_idx):
+            if grad_inputs[grad_inputs_idx] is None and grad_inputs_idx < num_required_grad_sample_args:
+                if not allow_unused_input:
+                    raise RuntimeError(
+                        "The input tensor requires grad, but the grad is None after backward pass."
+                    )
+            elif grad_inputs[grad_inputs_idx] is not None and grad_inputs_idx >= num_required_grad_sample_args:
+                module_params_with_grad.append(static_input_surface[inputs_idx])
+        if len(module_params_with_grad) != len(per_callable_module_params[func_idx]):
+            if warmup_iter != 0:
+                raise RuntimeError(
+                    "no-grad params should only be used as inputs in the first warmup"
+                    f" iteration, but found in iteration {warmup_iter}"
+                )
+            per_callable_module_params[func_idx] = tuple(module_params_with_grad)
+            static_input_surface = flatten_sample_args[func_idx] + tuple(module_params_with_grad)
+            per_callable_static_input_surfaces[func_idx] = static_input_surface
+
+        # Run wgrad. This is essential for some TE modules when they have
+        # delay_wgrad_compute enabled.
+        need_backward_dw = False
+        for module in visited_te_modules.get(func_idx, set()):
+            if hasattr(module, "need_backward_dw") and module.need_backward_dw():
+                need_backward_dw = True
+                module.backward_dw()
+        need_bwd_dw_graph[func_idx] = need_backward_dw
+
     # Run warmup and do the above filtering.
     with torch.cuda.stream(torch.cuda.Stream()):
-        for func_idx, func in zip(warmup_func_idx, warmup_func):
-            args = sample_args[func_idx]
-            kwargs = sample_kwargs[func_idx]
-            static_input_surface = per_callable_static_input_surfaces[func_idx]
+        if pre_warmup_hook is not None:
+            pre_warmup_hook()
 
-            def hook_fn(
-                module, inputs, outputs, func_idx=func_idx
-            ):  # pylint: disable=unused-argument
-                modules = set()
-                if isinstance(module, TransformerEngineBaseModule):
-                    modules.add(module)
-                # If forward is called on a BasicOperation directly the hook will run
-                elif isinstance(module, BasicOperation):
-                    modules.add(module)
-                elif hasattr(module, "need_backward_dw") and hasattr(module, "backward_dw"):
-                    modules.add(module)
-                # If forward is called on a te.ops.Sequential it is not called on its constituent ops
-                elif isinstance(module, Sequential):
-                    if module._module_groups is None:
-                        raise RuntimeError(
-                            "module._module_groups should have been initialized by warmup"
-                        )
-                    for module_group in module._module_groups:
-                        if isinstance(module_group, OperationFuser):
-                            for basic_op in module_group._basic_ops:
-                                modules.add(basic_op)
-                if modules:
-                    if func_idx not in visited_te_modules:
-                        visited_te_modules[func_idx] = modules
-                    else:
-                        visited_te_modules[func_idx].update(modules)
-
-            if pre_warmup_hook is not None:
-                pre_warmup_hook()
-            for warmup_iter in range(num_warmup_iters):
-                hooks = []
-                for module in func.modules():
-                    hook = module.register_forward_hook(hook_fn)
-                    hooks.append(hook)
-                outputs, _ = _tree_flatten(func(*args, **kwargs))
-                for hook in hooks:
-                    hook.remove()
+        for warmup_iter in range(num_warmup_iters):
+            if _order is None:
+                warmup_outputs = []
+                for func_idx, func in zip(warmup_func_idx, warmup_func):
+                    outputs = _run_warmup_forward(func_idx, func, func_idx)
+                    warmup_outputs.append((func_idx, func, outputs))
                 if is_training:
-                    inputs = tuple(i for i in static_input_surface if i.requires_grad)
-                    with _none_grad_context_wrapper(inputs):
-                        outputs_requiring_grad = tuple(
-                            o for o in outputs if o is not None and o.requires_grad
-                        )
-                        torch.autograd.backward(
-                            outputs_requiring_grad,
-                            grad_tensors=tuple(torch.empty_like(o) for o in outputs_requiring_grad),
-                        )
-                        grad_inputs = tuple(input.grad for input in inputs)
-
-                    # Filter module params that get None grad from grad_inputs and remove them
-                    # from static_input_surface. This is to ensure that the backward hooks
-                    # registered to these params are not wrongly triggered.
-                    num_required_grad_sample_args = sum(
-                        arg.requires_grad for arg in flatten_sample_args[func_idx]
-                    )
-                    required_grad_input_idx = []
-                    for i, arg in enumerate(static_input_surface):
-                        if arg.requires_grad:
-                            required_grad_input_idx.append(i)
-                    module_params_with_grad = []
-                    for grad_inputs_idx, inputs_idx in enumerate(required_grad_input_idx):
-                        if (
-                            grad_inputs[grad_inputs_idx] is None
-                            and grad_inputs_idx < num_required_grad_sample_args
-                        ):
-                            if not allow_unused_input:
-                                raise RuntimeError(
-                                    "The input tensor requires grad, but the grad is None after"
-                                    " backward pass."
-                                )
-                        elif (
-                            grad_inputs[grad_inputs_idx] is not None
-                            and grad_inputs_idx >= num_required_grad_sample_args
-                        ):
-                            module_params_with_grad.append(static_input_surface[inputs_idx])
-                    if len(module_params_with_grad) != len(per_callable_module_params[func_idx]):
-                        if warmup_iter != 0:
-                            raise RuntimeError(
-                                "no-grad params should only be used as inputs in the first warmup"
-                                f" iteration, but found in iteration {warmup_iter}"
+                    for func_idx, func, outputs in reversed(warmup_outputs):
+                        _run_warmup_backward(func_idx, func, outputs, warmup_iter, func_idx)
+            else:
+                per_fwd_outputs = {}
+                fwd_idx = [0] * num_model_chunks
+                bwd_idx = [0] * num_model_chunks
+                for c_id in _order:
+                    if c_id > 0:
+                        m_chunk = c_id - 1
+                        for l_no in range(_num_layers_per_chunk[m_chunk]):
+                            callable_idx = _prefix_num_layers[m_chunk] + l_no
+                            per_callable_fwd_idx = (_prefix_num_layers[m_chunk] * num_microbatches) + (
+                                fwd_idx[m_chunk] * _num_layers_per_chunk[m_chunk] + l_no
                             )
-                        per_callable_module_params[func_idx] = tuple(module_params_with_grad)
-                        static_input_surface = flatten_sample_args[func_idx] + tuple(
-                            module_params_with_grad
-                        )
-                        per_callable_static_input_surfaces[func_idx] = static_input_surface
+                            func = callables[callable_idx]
+                            outputs = _run_warmup_forward(per_callable_fwd_idx, func, callable_idx)
+                            per_fwd_outputs[per_callable_fwd_idx] = outputs
+                        fwd_idx[m_chunk] += 1
+                    elif ceil(c_id) == c_id:
+                        if is_training:
+                            m_chunk = -c_id - 1
+                            for l_no in reversed(range(_num_layers_per_chunk[m_chunk])):
+                                callable_idx = _prefix_num_layers[m_chunk] + l_no
+                                per_callable_bwd_idx = (
+                                    _prefix_num_layers[m_chunk] * num_microbatches
+                                ) + (bwd_idx[m_chunk] * _num_layers_per_chunk[m_chunk] + l_no)
+                                func = callables[callable_idx]
+                                outputs = per_fwd_outputs[per_callable_bwd_idx]
+                                _run_warmup_backward(
+                                    per_callable_bwd_idx,
+                                    func,
+                                    outputs,
+                                    warmup_iter,
+                                    callable_idx,
+                                )
+                            bwd_idx[m_chunk] += 1
 
-                    # Run wgrad. This is essential for some TE modules when they have
-                    # delay_wgrad_compute enabled.
-                    need_backward_dw = False
-                    for module in visited_te_modules.get(func_idx, set()):
-                        if hasattr(module, "need_backward_dw") and module.need_backward_dw():
-                            need_backward_dw = True
-                            module.backward_dw()
-                    need_bwd_dw_graph[func_idx] = need_backward_dw
-                else:
-                    grad_inputs = None
-                del outputs, grad_inputs
-            if post_warmup_hook is not None:
-                post_warmup_hook()
+        if post_warmup_hook is not None:
+            post_warmup_hook()
     torch.cuda.synchronize()
 
     # All captures here share a mempool. To avoid replays corrupting each other's memory,
@@ -833,15 +993,18 @@ def _make_graphed_callables(
                 # Capture forward graph for model chunk c_id, microbatch fwd_idx[c_id-1]
                 m_chunk = c_id - 1
                 for l_no in range(_num_layers_per_chunk[m_chunk]):
-                    func = callables[_prefix_num_layers[m_chunk] + l_no]
+                    callable_idx = _prefix_num_layers[m_chunk] + l_no
+                    func = callables[callable_idx]
                     per_callable_fwd_idx = (_prefix_num_layers[m_chunk] * num_microbatches) + (
                         fwd_idx[m_chunk] * _num_layers_per_chunk[m_chunk] + l_no
                     )
                     args = sample_args[per_callable_fwd_idx]
                     kwargs = sample_kwargs[per_callable_fwd_idx]
                     fwd_graph = fwd_graphs[per_callable_fwd_idx]
+                    _call_capture_time_forward_pre_hooks(callable_idx, func, args, kwargs)
                     with _graph_context_wrapper(fwd_graph, pool=mempool):
                         outputs = func(*args, **kwargs)
+                    _call_capture_time_forward_hooks(callable_idx, func, args, kwargs, outputs)
                     flatten_outputs, spec = _tree_flatten(outputs)
                     per_callable_static_outputs[per_callable_fwd_idx] = tuple(flatten_outputs)
                     per_callable_output_unflatten_spec[per_callable_fwd_idx] = spec
@@ -852,6 +1015,7 @@ def _make_graphed_callables(
                 m_chunk = -ceil(c_id) - 1
                 previous_per_callable_bwd_idx = None
                 for l_no in list(reversed(range(_num_layers_per_chunk[m_chunk]))):
+                    callable_idx = _prefix_num_layers[m_chunk] + l_no
                     per_callable_bwd_idx = (_prefix_num_layers[m_chunk] * num_microbatches) + (
                         bwd_idx[m_chunk] * _num_layers_per_chunk[m_chunk] + l_no
                     )
@@ -938,6 +1102,12 @@ def _make_graphed_callables(
                             for o in static_outputs
                         )
                     if is_training:
+                        func = graph_callables[per_callable_bwd_idx]
+                        _call_capture_time_backward_pre_hooks(
+                            callable_idx,
+                            func,
+                            static_grad_outputs,
+                        )
                         inputs = tuple(i for i in static_input_surface if i.requires_grad)
                         with _none_grad_context_wrapper(inputs), _graph_context_wrapper(
                             bwd_graph, pool=mempool
@@ -950,6 +1120,12 @@ def _make_graphed_callables(
                                 retain_graph=retain_graph_in_backward,
                             )
                             grad_inputs = tuple(input.grad for input in inputs)
+                        _call_capture_time_backward_hooks(
+                            callable_idx,
+                            func,
+                            grad_inputs,
+                            static_grad_outputs,
+                        )
 
                     # Constructs a tuple suitable for returning from Graphed.backward:
                     # Pads out the actually-needed grads with Nones in gradient slots for inputs
@@ -1024,12 +1200,14 @@ def _make_graphed_callables(
         # Capture forward graphs
         per_callable_static_outputs = []
         per_callable_output_unflatten_spec = []
-        graph_id = 0
-        for func, args, kwargs, fwd_graph in zip(callables, sample_args, sample_kwargs, fwd_graphs):
+        for func_idx, (func, args, kwargs, fwd_graph) in enumerate(
+            zip(callables, sample_args, sample_kwargs, fwd_graphs)
+        ):
+            _call_capture_time_forward_pre_hooks(func_idx, func, args, kwargs)
             with _graph_context_wrapper(fwd_graph, pool=mempool):
                 outputs = func(*args, **kwargs)
-            graph_callables[graph_id] = func
-            graph_id += 1
+            _call_capture_time_forward_hooks(func_idx, func, args, kwargs, outputs)
+            graph_callables[func_idx] = func
 
             flatten_outputs, spec = _tree_flatten(outputs)
             per_callable_static_outputs.append(tuple(flatten_outputs))
@@ -1052,6 +1230,8 @@ def _make_graphed_callables(
                 for o in static_outputs
             )
             if is_training:
+                func = graph_callables[bwd_idx]
+                _call_capture_time_backward_pre_hooks(bwd_idx, func, static_grad_outputs)
                 inputs = tuple(i for i in static_input_surface if i.requires_grad)
                 with _none_grad_context_wrapper(inputs), _graph_context_wrapper(
                     bwd_graph, pool=mempool
@@ -1062,6 +1242,7 @@ def _make_graphed_callables(
                         retain_graph=retain_graph_in_backward,
                     )
                     grad_inputs = tuple(input.grad for input in inputs)
+                _call_capture_time_backward_hooks(bwd_idx, func, grad_inputs, static_grad_outputs)
 
                 if need_bwd_dw_graph[bwd_idx]:
                     with _graph_context_wrapper(bwd_dw_graph, pool=mempool):
@@ -1442,6 +1623,7 @@ def make_graphed_callables(
     _clone_param_grads_on_return: bool = True,
     pre_warmup_hook: Optional[Callable] = None,
     post_warmup_hook: Optional[Callable] = None,
+    capture_time_hooks: Optional[List[Optional[Dict[str, Dict]]]] = None,
 ) -> Union[Callable, Tuple[Callable, ...]]:
     """
     Make CUDA graph version of Transformer Engine modules
@@ -1489,9 +1671,27 @@ def make_graphed_callables(
         tensors. Only disable this when the caller consumes returned parameter
         gradients before any such overwrite can occur.
     pre_warmup_hook: callable, default = None
-                      A hook function that will be called before the warmup iterations.
+                      A hook function that will be called once before all warmup iterations
+                      (not once per callable).
     post_warmup_hook: callable, default = None
-                      A hook function that will be called after the warmup iterations.
+                      A hook function that will be called once after all warmup iterations
+                      (not once per callable).
+    capture_time_hooks: list of dict, optional
+                        Per-callable hooks invoked during warmup and graph capture, but
+                        intentionally executed outside CUDA graph capture so they are not
+                        recorded into the graph and are not replayed. Each hook must return
+                        ``None``. Each list entry corresponds to one callable and may include
+                        these keys:
+                        ``"forward_pre_hooks"`` maps hook IDs to hooks with signature
+                        ``hook(module, args)`` or ``hook(module, args, kwargs)`` when the ID
+                        is present in ``"forward_pre_hooks_with_kwargs"``;
+                        ``"forward_hooks"`` maps hook IDs to hooks with signature
+                        ``hook(module, args, output)`` or ``hook(module, args, kwargs, output)``
+                        when the ID is present in ``"forward_hooks_with_kwargs"``;
+                        ``"backward_pre_hooks"`` maps hook IDs to
+                        ``hook(module, grad_output)``;
+                        ``"backward_hooks"`` maps hook IDs to
+                        ``hook(module, grad_input, grad_output)``.
 
     Quantization parameters
     -----------------------
@@ -1696,6 +1896,7 @@ def make_graphed_callables(
         _clone_param_grads_on_return=_clone_param_grads_on_return,
         pre_warmup_hook=pre_warmup_hook,
         post_warmup_hook=post_warmup_hook,
+        capture_time_hooks=capture_time_hooks,
     )
 
     # Ensures warmup does not affect numerics for ops such as dropout.
