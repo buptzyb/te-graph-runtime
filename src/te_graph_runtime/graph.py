@@ -867,7 +867,7 @@ def _make_graphed_callables(
 
     def _run_warmup_backward(func_idx, func, outputs, warmup_iter, callable_idx) -> None:
         static_input_surface = per_callable_static_input_surfaces[func_idx]
-        inputs = tuple(i for i in static_input_surface if i.requires_grad)
+        inputs = tuple(i for i in static_input_surface if i is not None and i.requires_grad)
         outputs_requiring_grad = tuple(o for o in outputs if o is not None and o.requires_grad)
         grad_outputs = _make_grad_outputs(outputs)
 
@@ -883,10 +883,13 @@ def _make_graphed_callables(
         # Filter module params that get None grad from grad_inputs and remove them
         # from static_input_surface. This is to ensure that the backward hooks
         # registered to these params are not wrongly triggered.
-        num_required_grad_sample_args = sum(arg.requires_grad for arg in flatten_sample_args[func_idx])
+        num_required_grad_sample_args = sum(
+            isinstance(arg, torch.Tensor) and arg.requires_grad
+            for arg in flatten_sample_args[func_idx]
+        )
         required_grad_input_idx = []
         for i, arg in enumerate(static_input_surface):
-            if arg.requires_grad:
+            if isinstance(arg, torch.Tensor) and arg.requires_grad:
                 required_grad_input_idx.append(i)
         module_params_with_grad = []
         for grad_inputs_idx, inputs_idx in enumerate(required_grad_input_idx):
@@ -1108,7 +1111,7 @@ def _make_graphed_callables(
                             func,
                             static_grad_outputs,
                         )
-                        inputs = tuple(i for i in static_input_surface if i.requires_grad)
+                        inputs = tuple(i for i in static_input_surface if i is not None and i.requires_grad)
                         with _none_grad_context_wrapper(inputs), _graph_context_wrapper(
                             bwd_graph, pool=mempool
                         ):
@@ -1232,7 +1235,7 @@ def _make_graphed_callables(
             if is_training:
                 func = graph_callables[bwd_idx]
                 _call_capture_time_backward_pre_hooks(bwd_idx, func, static_grad_outputs)
-                inputs = tuple(i for i in static_input_surface if i.requires_grad)
+                inputs = tuple(i for i in static_input_surface if i is not None and i.requires_grad)
                 with _none_grad_context_wrapper(inputs), _graph_context_wrapper(
                     bwd_graph, pool=mempool
                 ):
@@ -1311,6 +1314,7 @@ def _make_graphed_callables(
                 for i in range(len_user_args):
                     if (
                         isinstance(static_input_surface[i], torch.Tensor)
+                        and inputs[i] is not None
                         and static_input_surface[i].data_ptr() != inputs[i].data_ptr()
                     ):
                         static_input_surface[i].copy_(inputs[i])
