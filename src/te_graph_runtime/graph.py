@@ -1420,21 +1420,23 @@ def _make_graphed_callables(
                 user_kwargs.pop("cuda_graph_event")
             else:
                 cuda_graph_event = None
-            # Check that required kwargs are provided
-            for key in kwargs_keys:
-                if key not in user_kwargs:
-                    raise TypeError(
-                        f"Graphed callable was initialized with kwarg {key} ,"
-                        "but it was not provided in graph replay"
-                    )
-
             # Runs the autograd function with inputs == all inputs to
             # the graph that might require grad (explicit user args +
             # module parameters)
             # Assumes module params didn't change since capture.
-            flatten_user_args, _ = _tree_flatten(user_args)
-            flatten_user_kwargs, _ = _tree_flatten([user_kwargs[key] for key in kwargs_keys])
-            func_args = tuple(flatten_user_args) + tuple(flatten_user_kwargs) + module_params
+            # Reconstruct the same flattened arg order as capture time.
+            # User may pass some recorded kwargs as positional args, so
+            # check user_args first (by position), then user_kwargs.
+            user_pos_args = list(user_args)
+            kwarg_values = []
+            for key in kwargs_keys:
+                if key in user_kwargs:
+                    kwarg_values.append(user_kwargs[key])
+                elif user_pos_args:
+                    kwarg_values.append(user_pos_args.pop(0))
+                # else: key was a default not passed — skip (not a tensor)
+            flatten_user_kwargs, _ = _tree_flatten(kwarg_values)
+            func_args = tuple(flatten_user_kwargs) + module_params
             out = Graphed.apply(
                 skip_fp8_weight_update, cuda_graph_stream, cuda_graph_event, *func_args
             )
