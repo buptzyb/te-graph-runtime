@@ -972,6 +972,12 @@ def _make_graphed_callables(
             post_warmup_hook()
     torch.cuda.synchronize()
 
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+    gc.collect()
+    torch.cuda.empty_cache()
+
     # All captures here share a mempool. To avoid replays corrupting each other's memory,
     # the safest approach is to capture all passes in the same order they'll run:
     # fwd 1, fwd 2, ... fwd N, then bwd N, bwd N-1, ... bwd 1.
