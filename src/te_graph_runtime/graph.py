@@ -975,17 +975,6 @@ def _make_graphed_callables(
             post_warmup_hook()
     torch.cuda.synchronize()
 
-    # Release all warmup tensor references so gc.collect + empty_cache
-    # can actually free GPU memory before capture.
-    try:
-        del warmup_outputs
-    except (NameError, UnboundLocalError):
-        pass
-    try:
-        del per_fwd_outputs
-    except (NameError, UnboundLocalError):
-        pass
-
     import gc
     gc.collect()
     torch.cuda.empty_cache()
