@@ -131,6 +131,26 @@ def test_cuda_warmup_hooks_without_te(monkeypatch: pytest.MonkeyPatch) -> None:
     assert calls == {"pre": 1, "post": 1}
 
 
+def test_cuda_module_compile_is_stabilized_before_capture_without_te(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _force_no_te(monkeypatch)
+    model = torch.nn.Linear(4, 4).cuda()
+    model.compile(dynamic=False, options={"triton.cudagraphs": False})
+    sample = torch.randn(2, 4, device="cuda", requires_grad=True)
+
+    graphed = graph.make_graphed_callables(
+        model,
+        (sample,),
+        allow_unused_input=True,
+        num_warmup_iters=1,
+    )
+
+    x = torch.randn(2, 4, device="cuda", requires_grad=True)
+    graphed(x).sum().backward()
+    assert model.weight.grad is not None
+
+
 def _assert_not_cuda_capturing() -> None:
     is_current_stream_capturing = getattr(torch.cuda, "is_current_stream_capturing", None)
     if is_current_stream_capturing is not None:
