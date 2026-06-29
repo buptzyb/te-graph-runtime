@@ -919,8 +919,10 @@ def _make_graphed_callables(
                 module.backward_dw()
         need_bwd_dw_graph[func_idx] = need_backward_dw
 
-    # Run warmup and do the above filtering.
-    with torch.cuda.stream(torch.cuda.Stream()):
+    # Run warmup on the same stream as capture so workspace buffers
+    # stay in the same CUDA context and don't need re-allocation.
+    capture_stream = torch.cuda.Stream()
+    with torch.cuda.stream(capture_stream):
         if pre_warmup_hook is not None:
             pre_warmup_hook()
 
@@ -1011,7 +1013,7 @@ def _make_graphed_callables(
                     kwargs = sample_kwargs[per_callable_fwd_idx]
                     fwd_graph = fwd_graphs[per_callable_fwd_idx]
                     _call_capture_time_forward_pre_hooks(callable_idx, func, args, kwargs)
-                    with _graph_context_wrapper(fwd_graph, pool=mempool):
+                    with _graph_context_wrapper(fwd_graph, pool=mempool, stream=capture_stream):
                         outputs = func(*args, **kwargs)
                     _call_capture_time_forward_hooks(callable_idx, func, args, kwargs, outputs)
                     flatten_outputs, spec = _tree_flatten(outputs)
@@ -1028,7 +1030,7 @@ def _make_graphed_callables(
                     per_callable_bwd_idx = (_prefix_num_layers[m_chunk] * num_microbatches) + (
                         bwd_idx[m_chunk] * _num_layers_per_chunk[m_chunk] + l_no
                     )
-                    if ceil(c_id) == c_id and need_bwd_dw_graph[per_callable_bwd_idx]:
+                    if ceil(c_id) == c_id and need_bwd_dw_graph.get(per_callable_bwd_idx, False):
                         # Check if bwd graph has corresponding wgrad graph:
                         # Number of dgrad backward graphs should be equal to number of
                         # wgrad backward graphs.
@@ -1071,12 +1073,12 @@ def _make_graphed_callables(
                                 "The order diff of wgrad and dgrad must be 0.5, "
                                 f"get {ceil(c_id) - c_id}."
                             )
-                        if not need_bwd_dw_graph[per_callable_bwd_idx]:
+                        if not need_bwd_dw_graph.get(per_callable_bwd_idx, False):
                             raise RuntimeError(
                                 "No module needs wgrad computation but get float in order"
                             )
                         bwd_dw_graph = bwd_dw_graphs[per_callable_bwd_idx]
-                        with _graph_context_wrapper(bwd_dw_graph, pool=mempool):
+                        with _graph_context_wrapper(bwd_dw_graph, pool=mempool, stream=capture_stream):
                             for module in visited_te_modules[per_callable_bwd_idx]:
                                 if (
                                     hasattr(module, "need_backward_dw")
@@ -1119,7 +1121,7 @@ def _make_graphed_callables(
                         )
                         inputs = tuple(i for i in static_input_surface if i is not None and i.requires_grad)
                         with _none_grad_context_wrapper(inputs), _graph_context_wrapper(
-                            bwd_graph, pool=mempool
+                            bwd_graph, pool=mempool, stream=capture_stream
                         ):
                             torch.autograd.backward(
                                 tuple(
@@ -1213,7 +1215,7 @@ def _make_graphed_callables(
             zip(callables, sample_args, sample_kwargs, fwd_graphs)
         ):
             _call_capture_time_forward_pre_hooks(func_idx, func, args, kwargs)
-            with _graph_context_wrapper(fwd_graph, pool=mempool):
+            with _graph_context_wrapper(fwd_graph, pool=mempool, stream=capture_stream):
                 outputs = func(*args, **kwargs)
             _call_capture_time_forward_hooks(func_idx, func, args, kwargs, outputs)
             graph_callables[func_idx] = func
@@ -1253,8 +1255,8 @@ def _make_graphed_callables(
                     grad_inputs = tuple(input.grad for input in inputs)
                 _call_capture_time_backward_hooks(bwd_idx, func, grad_inputs, static_grad_outputs)
 
-                if need_bwd_dw_graph[bwd_idx]:
-                    with _graph_context_wrapper(bwd_dw_graph, pool=mempool):
+                if need_bwd_dw_graph.get(bwd_idx, False):
+                    with _graph_context_wrapper(bwd_dw_graph, pool=mempool, stream=capture_stream):
                         for module in visited_te_modules[bwd_idx]:
                             if hasattr(module, "need_backward_dw") and module.need_backward_dw():
                                 module.backward_dw()
