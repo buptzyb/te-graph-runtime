@@ -920,10 +920,9 @@ def _make_graphed_callables(
                 module.backward_dw()
         need_bwd_dw_graph[func_idx] = need_backward_dw
 
-    # Run warmup on the same stream as capture so workspace buffers
-    # stay in the same CUDA context and don't need re-allocation.
-    capture_stream = capture_stream or torch.cuda.Stream()
-    with torch.cuda.stream(capture_stream):
+    torch.cuda.synchronize()
+
+    with torch.cuda.stream(torch.cuda.Stream()):
         if pre_warmup_hook is not None:
             pre_warmup_hook()
 
@@ -980,6 +979,9 @@ def _make_graphed_callables(
     torch.cuda.empty_cache()
     gc.collect()
     torch.cuda.empty_cache()
+
+    # Capture stream — use caller-provided or create one.
+    capture_stream = capture_stream or torch.cuda.Stream()
 
     # All captures here share a mempool. To avoid replays corrupting each other's memory,
     # the safest approach is to capture all passes in the same order they'll run:
