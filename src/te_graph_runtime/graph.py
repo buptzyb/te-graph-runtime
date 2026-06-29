@@ -412,6 +412,7 @@ def _make_graphed_callables(
     pre_warmup_hook: Optional[Callable] = None,
     post_warmup_hook: Optional[Callable] = None,
     capture_time_hooks: Optional[List[Optional[Dict[str, Dict]]]] = None,
+    capture_stream: Optional[torch.cuda.Stream] = None,
 ) -> SingleOrTuple[Callable]:
     """
     Helper method for `make_graphed_callables`
@@ -921,7 +922,7 @@ def _make_graphed_callables(
 
     # Run warmup on the same stream as capture so workspace buffers
     # stay in the same CUDA context and don't need re-allocation.
-    capture_stream = torch.cuda.Stream()
+    capture_stream = capture_stream or torch.cuda.Stream()
     with torch.cuda.stream(capture_stream):
         if pre_warmup_hook is not None:
             pre_warmup_hook()
@@ -1638,6 +1639,7 @@ def make_graphed_callables(
     pre_warmup_hook: Optional[Callable] = None,
     post_warmup_hook: Optional[Callable] = None,
     capture_time_hooks: Optional[List[Optional[Dict[str, Dict]]]] = None,
+    capture_stream: Optional[torch.cuda.Stream] = None,
 ) -> Union[Callable, Tuple[Callable, ...]]:
     """
     Make CUDA graph version of Transformer Engine modules
@@ -1911,6 +1913,7 @@ def make_graphed_callables(
         pre_warmup_hook=pre_warmup_hook,
         post_warmup_hook=post_warmup_hook,
         capture_time_hooks=capture_time_hooks,
+        capture_stream=capture_stream,
     )
 
     # Ensures warmup does not affect numerics for ops such as dropout.
