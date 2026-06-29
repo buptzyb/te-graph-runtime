@@ -827,7 +827,7 @@ def _make_graphed_callables(
             torch.empty_like(o) if o is not None and o.requires_grad else None for o in outputs
         )
 
-    def _run_warmup_forward(func_idx, func, callable_idx):
+    def _run_warmup_forward(func_idx, func, callable_idx, register_discovery_hooks=True):
         args = sample_args[func_idx]
         kwargs = sample_kwargs[func_idx]
 
@@ -856,7 +856,7 @@ def _make_graphed_callables(
 
         _call_capture_time_forward_pre_hooks(callable_idx, func, args, kwargs)
         hooks = []
-        if isinstance(func, torch.nn.Module):
+        if register_discovery_hooks and isinstance(func, torch.nn.Module):
             for module in func.modules():
                 hooks.append(module.register_forward_hook(hook_fn))
         outputs = func(*args, **kwargs)
@@ -920,55 +920,84 @@ def _make_graphed_callables(
                 module.backward_dw()
         need_bwd_dw_graph[func_idx] = need_backward_dw
 
-    torch.cuda.synchronize()
+    def _run_warmup_iteration(warmup_iter, register_discovery_hooks):
+        if _order is None:
+            warmup_outputs = []
+            for func_idx, func in zip(warmup_func_idx, warmup_func):
+                outputs = _run_warmup_forward(
+                    func_idx,
+                    func,
+                    func_idx,
+                    register_discovery_hooks=register_discovery_hooks,
+                )
+                warmup_outputs.append((func_idx, func, outputs))
+            if is_training:
+                for func_idx, func, outputs in reversed(warmup_outputs):
+                    _run_warmup_backward(func_idx, func, outputs, warmup_iter, func_idx)
+            return
 
-    with torch.cuda.stream(torch.cuda.Stream()):
+        per_fwd_outputs = {}
+        fwd_idx = [0] * num_model_chunks
+        bwd_idx = [0] * num_model_chunks
+        for c_id in _order:
+            if c_id > 0:
+                m_chunk = c_id - 1
+                for l_no in range(_num_layers_per_chunk[m_chunk]):
+                    callable_idx = _prefix_num_layers[m_chunk] + l_no
+                    per_callable_fwd_idx = (_prefix_num_layers[m_chunk] * num_microbatches) + (
+                        fwd_idx[m_chunk] * _num_layers_per_chunk[m_chunk] + l_no
+                    )
+                    func = callables[callable_idx]
+                    outputs = _run_warmup_forward(
+                        per_callable_fwd_idx,
+                        func,
+                        callable_idx,
+                        register_discovery_hooks=register_discovery_hooks,
+                    )
+                    per_fwd_outputs[per_callable_fwd_idx] = outputs
+                fwd_idx[m_chunk] += 1
+            elif ceil(c_id) == c_id:
+                if is_training:
+                    m_chunk = -c_id - 1
+                    for l_no in reversed(range(_num_layers_per_chunk[m_chunk])):
+                        callable_idx = _prefix_num_layers[m_chunk] + l_no
+                        per_callable_bwd_idx = (
+                            _prefix_num_layers[m_chunk] * num_microbatches
+                        ) + (bwd_idx[m_chunk] * _num_layers_per_chunk[m_chunk] + l_no)
+                        func = callables[callable_idx]
+                        outputs = per_fwd_outputs[per_callable_bwd_idx]
+                        _run_warmup_backward(
+                            per_callable_bwd_idx,
+                            func,
+                            outputs,
+                            warmup_iter,
+                            callable_idx,
+                        )
+                    bwd_idx[m_chunk] += 1
+
+    # Run warmup on the same stream as capture so workspace buffers
+    # stay in the same CUDA context and don't need re-allocation.
+    capture_stream = capture_stream or torch.cuda.Stream()
+    with torch.cuda.stream(capture_stream):
         if pre_warmup_hook is not None:
             pre_warmup_hook()
 
         for warmup_iter in range(num_warmup_iters):
-            if _order is None:
-                warmup_outputs = []
-                for func_idx, func in zip(warmup_func_idx, warmup_func):
-                    outputs = _run_warmup_forward(func_idx, func, func_idx)
-                    warmup_outputs.append((func_idx, func, outputs))
-                if is_training:
-                    for func_idx, func, outputs in reversed(warmup_outputs):
-                        _run_warmup_backward(func_idx, func, outputs, warmup_iter, func_idx)
-            else:
-                per_fwd_outputs = {}
-                fwd_idx = [0] * num_model_chunks
-                bwd_idx = [0] * num_model_chunks
-                for c_id in _order:
-                    if c_id > 0:
-                        m_chunk = c_id - 1
-                        for l_no in range(_num_layers_per_chunk[m_chunk]):
-                            callable_idx = _prefix_num_layers[m_chunk] + l_no
-                            per_callable_fwd_idx = (_prefix_num_layers[m_chunk] * num_microbatches) + (
-                                fwd_idx[m_chunk] * _num_layers_per_chunk[m_chunk] + l_no
-                            )
-                            func = callables[callable_idx]
-                            outputs = _run_warmup_forward(per_callable_fwd_idx, func, callable_idx)
-                            per_fwd_outputs[per_callable_fwd_idx] = outputs
-                        fwd_idx[m_chunk] += 1
-                    elif ceil(c_id) == c_id:
-                        if is_training:
-                            m_chunk = -c_id - 1
-                            for l_no in reversed(range(_num_layers_per_chunk[m_chunk])):
-                                callable_idx = _prefix_num_layers[m_chunk] + l_no
-                                per_callable_bwd_idx = (
-                                    _prefix_num_layers[m_chunk] * num_microbatches
-                                ) + (bwd_idx[m_chunk] * _num_layers_per_chunk[m_chunk] + l_no)
-                                func = callables[callable_idx]
-                                outputs = per_fwd_outputs[per_callable_bwd_idx]
-                                _run_warmup_backward(
-                                    per_callable_bwd_idx,
-                                    func,
-                                    outputs,
-                                    warmup_iter,
-                                    callable_idx,
-                                )
-                            bwd_idx[m_chunk] += 1
+            _run_warmup_iteration(warmup_iter, register_discovery_hooks=True)
+
+        # TE discovery temporarily registers forward hooks, and Dynamo guards
+        # compiled modules on hook state. Capture runs after those hooks are
+        # removed, so warm the capture-equivalent specialization as well.
+        compiled_callables = any(
+            getattr(func, "_compiled_call_impl", None) is not None
+            or hasattr(getattr(func, "forward", None), "_torchdynamo_orig_callable")
+            for func in callables
+        )
+        if num_warmup_iters > 0 and compiled_callables:
+            _run_warmup_iteration(
+                num_warmup_iters,
+                register_discovery_hooks=False,
+            )
 
         if post_warmup_hook is not None:
             post_warmup_hook()
@@ -979,9 +1008,6 @@ def _make_graphed_callables(
     torch.cuda.empty_cache()
     gc.collect()
     torch.cuda.empty_cache()
-
-    # Capture stream — use caller-provided or create one.
-    capture_stream = capture_stream or torch.cuda.Stream()
 
     # All captures here share a mempool. To avoid replays corrupting each other's memory,
     # the safest approach is to capture all passes in the same order they'll run:
